@@ -1,11 +1,14 @@
-# Enhanced Face Detection with Raspberry Pi Camera
+# Face Recognition and Matching System for Raspberry Pi
 import cv2
 import subprocess
 import time
 import os
+import numpy as np
+import pickle
 from cvzone.FaceDetectionModule import FaceDetector
+import face_recognition
 
-class RPiFaceDetector:
+class FaceRecognitionSystem:
     def __init__(self, width=640, height=480, fps=15):
         self.width = width
         self.height = height
@@ -15,21 +18,30 @@ class RPiFaceDetector:
         self.cap = None
         self.rpicam_process = None
         
+        # Face recognition data
+        self.known_faces = {}  # Dictionary to store known face encodings
+        self.known_names = []  # List of known face names
+        self.known_encodings = []  # List of known face encodings
+        self.faces_data_file = 'known_faces.pkl'
+        
+        # Matching parameters
+        self.match_threshold = 0.6  # Lower = more strict matching
+        self.recognition_enabled = False
+        
+        # Load existing face data
+        self.load_known_faces()
+        
         # Statistics
         self.frame_count = 0
-        self.face_count_history = []
         self.start_time = time.time()
         
     def setup_camera_pipe(self):
         """Set up the named pipe for camera streaming"""
-        # Remove pipe if it exists
         if os.path.exists(self.pipe_name):
             os.remove(self.pipe_name)
         
-        # Create named pipe
         os.mkfifo(self.pipe_name)
         
-        # Start rpicam-vid to stream to the pipe
         self.rpicam_process = subprocess.Popen([
             'rpicam-vid', 
             '-t', '0',
@@ -40,16 +52,154 @@ class RPiFaceDetector:
             '-o', self.pipe_name
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # Wait for pipe to be ready
         time.sleep(2)
-        
-        # Open the pipe with OpenCV
         self.cap = cv2.VideoCapture(self.pipe_name)
         
         if not self.cap.isOpened():
             raise Exception("Failed to open camera pipe!")
             
         print("Camera pipe setup successful!")
+    
+    def save_known_faces(self):
+        """Save known faces to file"""
+        data = {
+            'names': self.known_names,
+            'encodings': self.known_encodings
+        }
+        with open(self.faces_data_file, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"Saved {len(self.known_names)} known faces to {self.faces_data_file}")
+    
+    def load_known_faces(self):
+        """Load known faces from file"""
+        if os.path.exists(self.faces_data_file):
+            try:
+                with open(self.faces_data_file, 'rb') as f:
+                    data = pickle.load(f)
+                self.known_names = data['names']
+                self.known_encodings = data['encodings']
+                print(f"Loaded {len(self.known_names)} known faces from {self.faces_data_file}")
+            except Exception as e:
+                print(f"Error loading known faces: {e}")
+                self.known_names = []
+                self.known_encodings = []
+        else:
+            print("No existing face data found. Starting fresh.")
+    
+    def add_face(self, frame, name):
+        """Add a new face to the known faces database"""
+        # Convert BGR to RGB for face_recognition
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Find face locations and encodings
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        
+        if len(face_encodings) == 0:
+            print("No face found in the image!")
+            return False
+        
+        if len(face_encodings) > 1:
+            print("Multiple faces found! Please ensure only one face is visible.")
+            return False
+        
+        # Add the face encoding
+        self.known_encodings.append(face_encodings[0])
+        self.known_names.append(name)
+        
+        # Save to file
+        self.save_known_faces()
+        
+        print(f"Face '{name}' added successfully!")
+        return True
+    
+    def recognize_faces(self, frame):
+        """Recognize faces in the current frame"""
+        if len(self.known_encodings) == 0:
+            return []
+        
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Find face locations and encodings
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        
+        recognized_faces = []
+        
+        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            # Compare with known faces
+            matches = face_recognition.compare_faces(self.known_encodings, face_encoding, tolerance=self.match_threshold)
+            distances = face_recognition.face_distance(self.known_encodings, face_encoding)
+            
+            name = "Unknown"
+            confidence = 0
+            
+            if True in matches:
+                # Find the best match
+                best_match_index = np.argmin(distances)
+                if matches[best_match_index]:
+                    name = self.known_names[best_match_index]
+                    confidence = 1 - distances[best_match_index]
+            
+            recognized_faces.append({
+                'name': name,
+                'confidence': confidence,
+                'location': (left, top, right, bottom)
+            })
+        
+        return recognized_faces
+    
+    def draw_recognition_results(self, frame, recognized_faces):
+        """Draw recognition results on the frame"""
+        for face in recognized_faces:
+            left, top, right, bottom = face['location']
+            name = face['name']
+            confidence = face['confidence']
+            
+            # Choose color based on recognition
+            if name == "Unknown":
+                color = (0, 0, 255)  # Red for unknown
+            else:
+                color = (0, 255, 0)  # Green for known
+            
+            # Draw rectangle around face
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            
+            # Draw name and confidence
+            label = f"{name}"
+            if name != "Unknown":
+                label += f" ({confidence:.2f})"
+            
+            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
+            cv2.putText(frame, label, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1)
+    
+    def compare_two_faces(self, recognized_faces):
+        """Compare two faces and determine if they match"""
+        if len(recognized_faces) == 2:
+            face1, face2 = recognized_faces
+            
+            # If both faces are recognized as the same person
+            if (face1['name'] == face2['name'] and 
+                face1['name'] != "Unknown" and 
+                face1['confidence'] > 0.5 and 
+                face2['confidence'] > 0.5):
+                return True, f"MATCH: Both faces are {face1['name']}"
+            
+            # If both are unknown, we can't determine
+            elif face1['name'] == "Unknown" and face2['name'] == "Unknown":
+                return None, "Both faces are unknown - cannot determine match"
+            
+            # If they're different known people
+            elif (face1['name'] != face2['name'] and 
+                  face1['name'] != "Unknown" and 
+                  face2['name'] != "Unknown"):
+                return False, f"NO MATCH: {face1['name']} vs {face2['name']}"
+            
+            else:
+                return None, "Cannot determine - one face unknown"
+        
+        return None, ""
     
     def calculate_fps(self):
         """Calculate current FPS"""
@@ -62,99 +212,126 @@ class RPiFaceDetector:
             return fps
         return None
     
-    def draw_face_info(self, frame, bboxs):
-        """Draw face detection information on frame"""
-        face_count = len(bboxs) if bboxs else 0
-        
-        # Draw face count
-        color = (0, 255, 0) if face_count > 0 else (0, 0, 255)
-        cv2.putText(frame, f'Faces: {face_count}', (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-        
-        # Draw individual face info
-        if bboxs:
-            for i, bbox in enumerate(bboxs):
-                x, y, w, h = bbox["bbox"]
-                score = bbox["score"][0]
-                
-                # Draw confidence score near each face
-                cv2.putText(frame, f'{score:.2f}', (x, y-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        
-        return face_count
-    
-    def draw_statistics(self, frame, fps=None):
-        """Draw performance statistics"""
-        if fps:
-            cv2.putText(frame, f'FPS: {fps:.1f}', (10, 70), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-        
-        # Average faces over last 30 frames
-        if len(self.face_count_history) > 0:
-            avg_faces = sum(self.face_count_history[-30:]) / min(30, len(self.face_count_history))
-            cv2.putText(frame, f'Avg Faces: {avg_faces:.1f}', (10, 100), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    
     def run(self):
-        """Main detection loop"""
+        """Main recognition loop"""
         try:
             self.setup_camera_pipe()
             
-            print("Starting enhanced face detection...")
+            print("\n=== Face Recognition System ===")
             print("Controls:")
             print("  'q' - Quit")
+            print("  'a' - Add current face (you'll be prompted for name)")
+            print("  'r' - Toggle recognition mode")
+            print("  'c' - Clear all known faces")
             print("  's' - Save screenshot")
-            print("  'r' - Reset statistics")
+            print("  'l' - List known faces")
+            print(f"\nKnown faces: {len(self.known_names)}")
             
             fps = 0
             screenshot_count = 0
+            adding_face = False
+            face_name_input = ""
             
             while True:
                 ret, frame = self.cap.read()
                 if not ret:
-                    print("No frame received, waiting...")
                     time.sleep(0.1)
                     continue
                 
                 self.frame_count += 1
+                original_frame = frame.copy()
                 
-                # Detect faces
+                # Basic face detection
                 frame, bboxs = self.detector.findFaces(frame)
                 
-                # Draw face information
-                face_count = self.draw_face_info(frame, bboxs)
-                self.face_count_history.append(face_count)
+                # Face recognition if enabled
+                recognized_faces = []
+                if self.recognition_enabled and len(self.known_encodings) > 0:
+                    recognized_faces = self.recognize_faces(original_frame)
+                    self.draw_recognition_results(frame, recognized_faces)
                 
-                # Calculate and display FPS
+                # Compare faces if exactly 2 are detected
+                match_result = ""
+                if len(recognized_faces) == 2:
+                    is_match, match_message = self.compare_two_faces(recognized_faces)
+                    if is_match is not None:
+                        match_result = match_message
+                        color = (0, 255, 0) if is_match else (0, 0, 255)
+                        cv2.putText(frame, match_result, (10, 150), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                # Display info
+                face_count = len(bboxs) if bboxs else 0
+                cv2.putText(frame, f'Faces: {face_count}', (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                # Display FPS
                 current_fps = self.calculate_fps()
                 if current_fps:
                     fps = current_fps
+                cv2.putText(frame, f'FPS: {fps:.1f}', (10, 70), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                 
-                self.draw_statistics(frame, fps)
+                # Display recognition status
+                status = "ON" if self.recognition_enabled else "OFF"
+                cv2.putText(frame, f'Recognition: {status}', (10, 100), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
-                # Draw instructions
-                cv2.putText(frame, "Press 'q' to quit, 's' to save", 
+                # Display known faces count
+                cv2.putText(frame, f'Known: {len(self.known_names)}', (10, 130), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                
+                # Instructions
+                cv2.putText(frame, "Press 'a' to add face, 'r' to toggle recognition", 
                            (10, frame.shape[0] - 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
-                # Display frame
-                cv2.imshow('Enhanced Face Detection', frame)
+                if adding_face:
+                    cv2.putText(frame, "Adding face mode - Press ENTER when ready", 
+                               (10, frame.shape[0] - 50), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                
+                cv2.imshow('Face Recognition System', frame)
                 
                 # Handle key presses
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
+                elif key == ord('a'):
+                    if face_count == 1:
+                        name = input("\nEnter name for this face: ").strip()
+                        if name:
+                            if self.add_face(original_frame, name):
+                                print(f"Face '{name}' added successfully!")
+                            else:
+                                print("Failed to add face. Try again.")
+                    else:
+                        print(f"Please ensure exactly 1 face is visible (currently {face_count})")
+                
+                elif key == ord('r'):
+                    self.recognition_enabled = not self.recognition_enabled
+                    status = "enabled" if self.recognition_enabled else "disabled"
+                    print(f"Recognition {status}")
+                
+                elif key == ord('c'):
+                    self.known_names.clear()
+                    self.known_encodings.clear()
+                    self.save_known_faces()
+                    print("All known faces cleared!")
+                
                 elif key == ord('s'):
                     screenshot_count += 1
-                    filename = f'face_detection_screenshot_{screenshot_count}.jpg'
+                    filename = f'face_recognition_{screenshot_count}.jpg'
                     cv2.imwrite(filename, frame)
                     print(f"Screenshot saved as {filename}")
-                elif key == ord('r'):
-                    self.face_count_history.clear()
-                    print("Statistics reset")
+                
+                elif key == ord('l'):
+                    print(f"\nKnown faces ({len(self.known_names)}):")
+                    for i, name in enumerate(self.known_names):
+                        print(f"  {i+1}. {name}")
                     
         except KeyboardInterrupt:
-            print("\nStopping face detection...")
+            print("\nStopping face recognition...")
         
         finally:
             self.cleanup()
@@ -170,7 +347,6 @@ class RPiFaceDetector:
         
         cv2.destroyAllWindows()
         
-        # Clean up pipe
         if os.path.exists(self.pipe_name):
             os.remove(self.pipe_name)
         
@@ -178,6 +354,10 @@ class RPiFaceDetector:
 
 # Main execution
 if __name__ == "__main__":
-    # Create and run the face detector
-    detector = RPiFaceDetector(width=640, height=480, fps=15)
-    detector.run()
+    # Create and run the face recognition system
+    recognition_system = FaceRecognitionSystem(width=640, height=480, fps=15)
+    recognition_system.run()
+
+
+
+    
