@@ -105,46 +105,72 @@ class ThreadedFaceRecognitionSystem:
         cv2.namedWindow('Face Recognition System', cv2.WINDOW_AUTOSIZE)
     
     def recognize_faces_optimized(self, frame):
-        """Optimized face recognition with reduced image size"""
-        if len(self.known_encodings) == 0:
+        try:
+            with self.processing_lock:
+                if not self.known_encodings:
+                    return []
+
+                # Ultra-lightweight processing
+                small_frame = cv2.resize(frame, (160, 120))  # Fixed size for consistency
+                rgb_small_frame = np.ascontiguousarray(small_frame[:, :, ::-1])  # BGR to RGB
+
+                # Conservative face detection
+                face_locations = face_recognition.face_locations(
+                    rgb_small_frame,
+                    model="hog",
+                    number_of_times_to_upsample=0  # Critical for Pi stability
+                )
+                
+                if not face_locations:
+                    return []
+
+                # Process one face at a time
+                recognized_faces = []
+                for top, right, bottom, left in face_locations:
+                    try:
+                        face_encoding = face_recognition.face_encodings(
+                            rgb_small_frame,
+                            known_face_locations=[(top, right, bottom, left)],
+                            num_jitters=0  # Disable for stability
+                        )[0]
+                        
+                        distances = face_recognition.face_distance(
+                            [np.array(x, dtype=np.float16) for x in self.known_encodings],
+                            np.array(face_encoding, dtype=np.float16)
+                        )
+                        
+                        best_match_idx = np.argmin(distances)
+                        confidence = 1 - distances[best_match_idx]
+                        
+                        if confidence > self.match_threshold:
+                            name = self.known_names[best_match_idx]
+                        else:
+                            name = "Unknown"
+                            confidence = 0
+                        
+                        # Scale coordinates back
+                        scale_x = frame.shape[1] / small_frame.shape[1]
+                        scale_y = frame.shape[0] / small_frame.shape[0]
+                        recognized_faces.append({
+                            'name': name,
+                            'confidence': confidence,
+                            'location': (
+                                int(left * scale_x),
+                                int(top * scale_y),
+                                int(right * scale_x),
+                                int(bottom * scale_y)
+                            )
+                        })
+                        
+                    except Exception as e:
+                        logging.error(f"Face processing error: {e}")
+                        continue
+                        
+                return recognized_faces
+            
+        except Exception as e:
+            logging.critical(f"Recognition crash: {e}")
             return []
-        
-        # Resize frame for faster processing
-        small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-        
-        # Find face locations and encodings in smaller image
-        face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")
-        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
-        
-        recognized_faces = []
-        
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            # Scale back up face locations
-            top *= 2
-            right *= 2
-            bottom *= 2
-            left *= 2
-            
-            # Compare with known faces
-            distances = face_recognition.face_distance(self.known_encodings, face_encoding)
-            
-            name = "Unknown"
-            confidence = 0
-            
-            if len(distances) > 0:
-                best_match_index = np.argmin(distances)
-                if distances[best_match_index] < self.match_threshold:
-                    name = self.known_names[best_match_index]
-                    confidence = 1 - distances[best_match_index]
-            
-            recognized_faces.append({
-                'name': name,
-                'confidence': confidence,
-                'location': (left, top, right, bottom)
-            })
-        
-        return recognized_faces
     
     def process_recognition_async(self, frame, frame_number):
         """Process face recognition asynchronously"""
