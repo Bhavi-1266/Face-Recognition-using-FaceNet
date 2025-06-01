@@ -67,40 +67,10 @@ class ThreadedFaceRecognitionSystem:
         # Async processing storage
         self.pending_futures = []
         
-    def disable_camera_services(self):
-        """Disable interfering camera services"""
-        try:
-            print("Stopping interfering camera services...")
-            
-            # Kill any existing camera processes
-            subprocess.run(['sudo', 'pkill', '-f', 'rpicam'], stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'pkill', '-f', 'libcamera'], stderr=subprocess.DEVNULL)
-            subprocess.run(['sudo', 'pkill', '-f', 'vcgencmd'], stderr=subprocess.DEVNULL)
-            
-            # Stop camera-related services
-            services_to_stop = [
-                'rpicam-hello.service',
-                'camera.service',
-                'libcamera.service'
-            ]
-            
-            for service in services_to_stop:
-                try:
-                    subprocess.run(['sudo', 'systemctl', 'stop', service], 
-                                 stderr=subprocess.DEVNULL, timeout=5)
-                except:
-                    pass
-            
-            time.sleep(1)
-            print("Camera services stopped.")
-            
-        except Exception as e:
-            print(f"Warning: Could not stop camera services: {e}")
-        
+
     def setup_camera_pipe(self):
         """Set up the named pipe for camera streaming"""
         # First disable interfering services
-        self.disable_camera_services()
         
         if os.path.exists(self.pipe_name):
             os.remove(self.pipe_name)
