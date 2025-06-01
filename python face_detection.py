@@ -1,4 +1,4 @@
-# Face Recognition and Matching System for Raspberry Pi - THREADED OPTIMIZED VERSION
+# Face Recognition and Matching System for Raspberry Pi - FIXED THREADED VERSION
 import cv2
 import subprocess
 import time
@@ -24,14 +24,11 @@ class ThreadedFaceRecognitionSystem:
         self.rpicam_process = None
         
         # Threading components
-        self.frame_queue = Queue(maxsize=10)  # Input frames
-        self.result_queue = Queue(maxsize=10)  # Processed results
-        self.processing_pool = ThreadPoolExecutor(max_workers=3)  # Adjust based on Pi capabilities
-        self.frame_counter = 0
+        self.processing_pool = ThreadPoolExecutor(max_workers=2)
         self.processing_lock = threading.Lock()
         self.stop_event = threading.Event()
         
-        # Frame skipping for performance
+        # Frame processing optimization
         self.skip_frames = 2  # Process every 3rd frame for recognition
         self.frame_skip_counter = 0
         
@@ -63,23 +60,55 @@ class ThreadedFaceRecognitionSystem:
         self.frame_count = 0
         self.processed_frame_count = 0
         self.start_time = time.time()
-        self.fps_queue = collections.deque(maxlen=30)  # Rolling FPS calculation
+        self.last_fps_time = time.time()
+        self.fps_counter = 0
+        self.current_fps = 0
         
-        # Start background threads
-        self.start_background_threads()
+        # Async processing storage
+        self.pending_futures = []
         
-    def start_background_threads(self):
-        """Start background processing threads"""
-        self.frame_capture_thread = threading.Thread(target=self.frame_capture_worker, daemon=True)
-        self.frame_processing_thread = threading.Thread(target=self.frame_processing_worker, daemon=True)
+    def disable_camera_services(self):
+        """Disable interfering camera services"""
+        try:
+            print("Stopping interfering camera services...")
+            
+            # Kill any existing camera processes
+            subprocess.run(['sudo', 'pkill', '-f', 'rpicam'], stderr=subprocess.DEVNULL)
+            subprocess.run(['sudo', 'pkill', '-f', 'libcamera'], stderr=subprocess.DEVNULL)
+            subprocess.run(['sudo', 'pkill', '-f', 'vcgencmd'], stderr=subprocess.DEVNULL)
+            
+            # Stop camera-related services
+            services_to_stop = [
+                'rpicam-hello.service',
+                'camera.service',
+                'libcamera.service'
+            ]
+            
+            for service in services_to_stop:
+                try:
+                    subprocess.run(['sudo', 'systemctl', 'stop', service], 
+                                 stderr=subprocess.DEVNULL, timeout=5)
+                except:
+                    pass
+            
+            time.sleep(1)
+            print("Camera services stopped.")
+            
+        except Exception as e:
+            print(f"Warning: Could not stop camera services: {e}")
         
     def setup_camera_pipe(self):
         """Set up the named pipe for camera streaming"""
+        # First disable interfering services
+        self.disable_camera_services()
+        
         if os.path.exists(self.pipe_name):
             os.remove(self.pipe_name)
         
         os.mkfifo(self.pipe_name)
         
+        # Start rpicam-vid process
+        print("Starting camera process...")
         self.rpicam_process = subprocess.Popen([
             'rpicam-vid', 
             '-t', '0',
@@ -87,127 +116,23 @@ class ThreadedFaceRecognitionSystem:
             '--height', str(self.height),
             '--framerate', str(self.fps),
             '--codec', 'mjpeg',
+            '--nopreview',  # Disable preview window
             '-o', self.pipe_name
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        time.sleep(1)
+        time.sleep(2)  # Give more time for pipe to be ready
+        
+        print("Opening camera pipe...")
         self.cap = cv2.VideoCapture(self.pipe_name)
         
         if not self.cap.isOpened():
             raise Exception("Failed to open camera pipe!")
             
         # Optimize capture settings
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize latency
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         print("Camera pipe setup successful!")
         cv2.namedWindow('Face Recognition System', cv2.WINDOW_AUTOSIZE)
-    
-    def frame_capture_worker(self):
-        """Background thread for capturing frames"""
-        while not self.stop_event.is_set():
-            try:
-                ret, frame = self.cap.read()
-                if ret:
-                    # Only keep the latest frame in queue
-                    if not self.frame_queue.full():
-                        self.frame_queue.put((self.frame_counter, frame), block=False)
-                    else:
-                        # Drop oldest frame and add new one
-                        try:
-                            self.frame_queue.get_nowait()
-                        except Empty:
-                            pass
-                        self.frame_queue.put((self.frame_counter, frame), block=False)
-                    
-                    self.frame_counter += 1
-                else:
-                    time.sleep(0.01)
-            except Exception as e:
-                print(f"Frame capture error: {e}")
-                time.sleep(0.1)
-    
-    def frame_processing_worker(self):
-        """Background thread for processing frames"""
-        while not self.stop_event.is_set():
-            try:
-                frame_id, frame = self.frame_queue.get(timeout=0.1)
-                
-                # Skip frames for performance
-                self.frame_skip_counter += 1
-                should_process_recognition = (self.frame_skip_counter % (self.skip_frames + 1) == 0)
-                
-                # Submit processing task
-                future = self.processing_pool.submit(
-                    self.process_frame_async, 
-                    frame_id, 
-                    frame.copy(), 
-                    should_process_recognition
-                )
-                
-                # Non-blocking result handling
-                try:
-                    result = future.result(timeout=0.001)  # Very short timeout
-                    if result:
-                        if not self.result_queue.full():
-                            self.result_queue.put(result, block=False)
-                        else:
-                            # Replace oldest result
-                            try:
-                                self.result_queue.get_nowait()
-                            except Empty:
-                                pass
-                            self.result_queue.put(result, block=False)
-                except:
-                    # Future not ready yet, continue
-                    pass
-                    
-            except Empty:
-                continue
-            except Exception as e:
-                print(f"Frame processing error: {e}")
-    
-    def process_frame_async(self, frame_id, frame, should_process_recognition):
-        """Asynchronously process a single frame"""
-        try:
-            result = {
-                'frame_id': frame_id,
-                'frame': frame,
-                'faces': [],
-                'recognized_faces': [],
-                'timestamp': time.time()
-            }
-            
-            # Basic face detection (faster)
-            frame_with_faces, bboxs = self.detector.findFaces(frame, draw=False)
-            result['faces'] = bboxs if bboxs else []
-            
-            # Face recognition (slower, so we skip frames)
-            if (should_process_recognition and 
-                self.recognition_enabled and 
-                len(self.known_encodings) > 0 and 
-                len(result['faces']) > 0):
-                
-                recognized_faces = self.recognize_faces_optimized(frame)
-                result['recognized_faces'] = recognized_faces
-                
-                # Cache the result
-                with self.processing_lock:
-                    self.last_recognition_result = recognized_faces
-                    self.last_recognition_frame = frame_id
-            
-            elif self.recognition_enabled:
-                # Use cached result if available and recent
-                with self.processing_lock:
-                    if (self.last_recognition_result and 
-                        frame_id - self.last_recognition_frame < self.recognition_cache_duration):
-                        result['recognized_faces'] = self.last_recognition_result
-            
-            self.processed_frame_count += 1
-            return result
-            
-        except Exception as e:
-            print(f"Frame processing error: {e}")
-            return None
     
     def recognize_faces_optimized(self, frame):
         """Optimized face recognition with reduced image size"""
@@ -219,7 +144,7 @@ class ThreadedFaceRecognitionSystem:
         rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
         
         # Find face locations and encodings in smaller image
-        face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")  # Use HOG model for speed
+        face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")
         face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
         
         recognized_faces = []
@@ -251,6 +176,15 @@ class ThreadedFaceRecognitionSystem:
         
         return recognized_faces
     
+    def process_recognition_async(self, frame, frame_number):
+        """Process face recognition asynchronously"""
+        try:
+            result = self.recognize_faces_optimized(frame)
+            return frame_number, result
+        except Exception as e:
+            print(f"Recognition error: {e}")
+            return frame_number, []
+    
     def save_known_faces(self):
         """Save known faces to file"""
         data = {
@@ -279,7 +213,6 @@ class ThreadedFaceRecognitionSystem:
     
     def add_face(self, frame, name):
         """Add a new face to the known faces database"""
-        # Use full resolution for adding faces (more accurate)
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
         face_locations = face_recognition.face_locations(rgb_frame)
@@ -343,16 +276,16 @@ class ThreadedFaceRecognitionSystem:
         return None, ""
     
     def calculate_fps(self):
-        """Calculate current FPS with rolling average"""
+        """Calculate current FPS"""
         current_time = time.time()
-        self.fps_queue.append(current_time)
+        self.fps_counter += 1
         
-        if len(self.fps_queue) >= 2:
-            time_diff = self.fps_queue[-1] - self.fps_queue[0]
-            if time_diff > 0:
-                fps = (len(self.fps_queue) - 1) / time_diff
-                return fps
-        return 0
+        if current_time - self.last_fps_time >= 1.0:
+            self.current_fps = self.fps_counter / (current_time - self.last_fps_time)
+            self.fps_counter = 0
+            self.last_fps_time = current_time
+        
+        return self.current_fps
     
     def handle_text_input(self, key):
         """Handle text input for face naming"""
@@ -387,15 +320,11 @@ class ThreadedFaceRecognitionSystem:
             self.face_name_buffer += chr(key)
     
     def run(self):
-        """Main recognition loop"""
+        """Main recognition loop with optimized threading"""
         try:
             self.setup_camera_pipe()
             
-            # Start background threads
-            self.frame_capture_thread.start()
-            self.frame_processing_thread.start()
-            
-            print("\n=== Threaded Face Recognition System ===")
+            print("\n=== Optimized Face Recognition System ===")
             print("Controls:")
             print("  'q' - Quit")
             print("  'a' - Add current face (type name and press ENTER)")
@@ -410,84 +339,121 @@ class ThreadedFaceRecognitionSystem:
             print("\nMake sure the OpenCV window has focus for key presses to work!")
             
             screenshot_count = 0
-            display_frame = None
+            recognized_faces = []
             
             while True:
-                # Get the latest processed result
-                try:
-                    result = self.result_queue.get_nowait()
-                    display_frame = result['frame'].copy()
-                    
-                    # Draw face detection results
-                    if result['faces']:
-                        for bbox in result['faces']:
-                            x, y, w, h = bbox['bbox']
-                            cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                    
-                    # Draw recognition results
-                    if result['recognized_faces']:
-                        self.draw_recognition_results(display_frame, result['recognized_faces'])
-                        
-                        # Compare faces if exactly 2 are detected
-                        if len(result['recognized_faces']) == 2:
-                            is_match, match_message = self.compare_two_faces(result['recognized_faces'])
-                            if is_match is not None:
-                                color = (0, 255, 0) if is_match else (0, 0, 255)
-                                cv2.putText(display_frame, match_message, (10, 200), 
-                                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                    
-                except Empty:
-                    # No new results, keep displaying last frame
-                    pass
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("Failed to read frame, retrying...")
+                    time.sleep(0.1)
+                    continue
                 
-                if display_frame is not None:
-                    # Display info
-                    face_count = len(result.get('faces', []))
-                    cv2.putText(display_frame, f'Faces: {face_count}', (10, 30), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    
-                    # Display FPS
-                    fps = self.calculate_fps()
-                    cv2.putText(display_frame, f'FPS: {fps:.1f}', (10, 70), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                    
-                    # Display processing stats
-                    cv2.putText(display_frame, f'Processed: {self.processed_frame_count}', (10, 100), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
-                    
-                    # Display recognition status
-                    status = "ON" if self.recognition_enabled else "OFF"
-                    cv2.putText(display_frame, f'Recognition: {status}', (10, 130), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    
-                    # Display known faces count
-                    cv2.putText(display_frame, f'Known: {len(self.known_names)}', (10, 160), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                    
-                    # Display frame skip info
-                    cv2.putText(display_frame, f'Skip: {self.skip_frames}', (10, 190), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 1)
+                self.frame_count += 1
+                original_frame = frame.copy()
                 
-                    # Display input mode status
-                    if self.adding_face_mode:
-                        if self.input_mode:
-                            input_text = f"Name: {self.face_name_buffer}_"
-                            cv2.putText(display_frame, input_text, (10, 220), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            cv2.putText(display_frame, "Type name and press ENTER (ESC to cancel)", 
-                                       (10, display_frame.shape[0] - 50), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # Basic face detection (always performed)
+                frame_with_faces, bboxs = self.detector.findFaces(frame)
+                face_count = len(bboxs) if bboxs else 0
+                
+                # Handle completed recognition futures
+                completed_futures = []
+                for i, future in enumerate(self.pending_futures):
+                    if future.done():
+                        try:
+                            frame_num, result = future.result()
+                            with self.processing_lock:
+                                self.last_recognition_result = result
+                                self.last_recognition_frame = frame_num
+                            self.processed_frame_count += 1
+                            completed_futures.append(i)
+                        except Exception as e:
+                            print(f"Recognition future error: {e}")
+                            completed_futures.append(i)
+                
+                # Remove completed futures
+                for i in reversed(completed_futures):
+                    self.pending_futures.pop(i)
+                
+                # Start new recognition task if needed
+                self.frame_skip_counter += 1
+                should_process = (self.frame_skip_counter % (self.skip_frames + 1) == 0)
+                
+                if (should_process and 
+                    self.recognition_enabled and 
+                    len(self.known_encodings) > 0 and 
+                    face_count > 0 and
+                    len(self.pending_futures) < 2):  # Limit concurrent futures
+                    
+                    future = self.processing_pool.submit(
+                        self.process_recognition_async, 
+                        original_frame.copy(), 
+                        self.frame_count
+                    )
+                    self.pending_futures.append(future)
+                
+                # Use cached recognition results
+                if self.recognition_enabled:
+                    with self.processing_lock:
+                        if (self.last_recognition_result and 
+                            self.frame_count - self.last_recognition_frame < self.recognition_cache_duration):
+                            recognized_faces = self.last_recognition_result
                         else:
-                            cv2.putText(display_frame, "Face captured! Now type the name...", 
-                                       (10, 220), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                            recognized_faces = []
+                
+                # Draw recognition results
+                if recognized_faces:
+                    self.draw_recognition_results(frame_with_faces, recognized_faces)
                     
-                    # Instructions
-                    cv2.putText(display_frame, "Press 'a' to add face, 'r' to toggle recognition", 
-                               (10, display_frame.shape[0] - 20), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    
-                    cv2.imshow('Face Recognition System', display_frame)
+                    # Compare faces if exactly 2 are detected
+                    if len(recognized_faces) == 2:
+                        is_match, match_message = self.compare_two_faces(recognized_faces)
+                        if is_match is not None:
+                            color = (0, 255, 0) if is_match else (0, 0, 255)
+                            cv2.putText(frame_with_faces, match_message, (10, 200), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                # Display info overlays
+                cv2.putText(frame_with_faces, f'Faces: {face_count}', (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                fps = self.calculate_fps()
+                cv2.putText(frame_with_faces, f'FPS: {fps:.1f}', (10, 70), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                
+                status = "ON" if self.recognition_enabled else "OFF"
+                cv2.putText(frame_with_faces, f'Recognition: {status}', (10, 100), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                cv2.putText(frame_with_faces, f'Known: {len(self.known_names)}', (10, 130), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                
+                cv2.putText(frame_with_faces, f'Skip: {self.skip_frames}', (10, 160), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 1)
+                
+                cv2.putText(frame_with_faces, f'Processed: {self.processed_frame_count}', (10, 180), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+                
+                # Display input mode status
+                if self.adding_face_mode:
+                    if self.input_mode:
+                        input_text = f"Name: {self.face_name_buffer}_"
+                        cv2.putText(frame_with_faces, input_text, (10, 220), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(frame_with_faces, "Type name and press ENTER (ESC to cancel)", 
+                                   (10, frame_with_faces.shape[0] - 50), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(frame_with_faces, "Face captured! Now type the name...", 
+                                   (10, 220), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Instructions
+                cv2.putText(frame_with_faces, "Press 'a' to add face, 'r' to toggle recognition", 
+                           (10, frame_with_faces.shape[0] - 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Show the frame
+                cv2.imshow('Face Recognition System', frame_with_faces)
                 
                 # Handle key presses
                 key = cv2.waitKey(1) & 0xFF
@@ -499,16 +465,14 @@ class ThreadedFaceRecognitionSystem:
                         break
                         
                     elif key == ord('a'):
-                        if display_frame is not None:
-                            face_count = len(result.get('faces', []))
-                            if face_count == 1:
-                                print(f"Adding face mode activated. Face count: {face_count}")
-                                self.adding_face_mode = True
-                                self.input_mode = True
-                                self.pending_face_frame = display_frame.copy()
-                                self.face_name_buffer = ""
-                            else:
-                                print(f"Please ensure exactly 1 face is visible (currently {face_count})")
+                        if face_count == 1:
+                            print(f"Adding face mode activated. Face count: {face_count}")
+                            self.adding_face_mode = True
+                            self.input_mode = True
+                            self.pending_face_frame = original_frame.copy()
+                            self.face_name_buffer = ""
+                        else:
+                            print(f"Please ensure exactly 1 face is visible (currently {face_count})")
                     
                     elif key == ord('r'):
                         self.recognition_enabled = not self.recognition_enabled
@@ -522,11 +486,10 @@ class ThreadedFaceRecognitionSystem:
                         print("All known faces cleared!")
                     
                     elif key == ord('s'):
-                        if display_frame is not None:
-                            screenshot_count += 1
-                            filename = f'face_recognition_{screenshot_count}.jpg'
-                            cv2.imwrite(filename, display_frame)
-                            print(f"Screenshot saved as {filename}")
+                        screenshot_count += 1
+                        filename = f'face_recognition_{screenshot_count}.jpg'
+                        cv2.imwrite(filename, frame_with_faces)
+                        print(f"Screenshot saved as {filename}")
                     
                     elif key == ord('l'):
                         print(f"\nKnown faces ({len(self.known_names)}):")
@@ -554,15 +517,12 @@ class ThreadedFaceRecognitionSystem:
         """Clean up resources"""
         print("Starting cleanup...")
         
-        # Stop background threads
+        # Stop event to signal threads
         self.stop_event.set()
         
-        # Wait for threads to finish
-        if hasattr(self, 'frame_capture_thread') and self.frame_capture_thread.is_alive():
-            self.frame_capture_thread.join(timeout=2)
-        
-        if hasattr(self, 'frame_processing_thread') and self.frame_processing_thread.is_alive():
-            self.frame_processing_thread.join(timeout=2)
+        # Cancel pending futures
+        for future in self.pending_futures:
+            future.cancel()
         
         # Shutdown thread pool
         self.processing_pool.shutdown(wait=True)
@@ -584,6 +544,6 @@ class ThreadedFaceRecognitionSystem:
 
 # Main execution
 if __name__ == "__main__":
-    # Create and run the threaded face recognition system
+    # Create and run the optimized face recognition system
     recognition_system = ThreadedFaceRecognitionSystem(width=640, height=480, fps=15)
     recognition_system.run()
