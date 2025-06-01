@@ -1,4 +1,4 @@
-# Optimized Face Recognition System for Raspberry Pi - Crash Resistant Version
+# Face Recognition and Matching System for Raspberry Pi - FINAL STABLE VERSION
 import cv2
 import subprocess
 import time
@@ -8,9 +8,10 @@ import pickle
 from cvzone.FaceDetectionModule import FaceDetector
 import face_recognition
 import threading
+import sys
 import logging
-import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 # Setup logging
 logging.basicConfig(
@@ -21,7 +22,7 @@ logging.basicConfig(
 )
 
 class ThreadedFaceRecognitionSystem:
-    def __init__(self, width=320, height=240, fps=10):
+    def __init__(self, width=640, height=480, fps=15):
         self.width = width
         self.height = height
         self.fps = fps
@@ -36,7 +37,7 @@ class ThreadedFaceRecognitionSystem:
         self.stop_event = threading.Event()
 
         # Frame processing optimization
-        self.skip_frames = 6  # Process every 7th frame
+        self.skip_frames = 4  # Process every 5th frame
         self.frame_skip_counter = 0
 
         # Face recognition data
@@ -60,6 +61,9 @@ class ThreadedFaceRecognitionSystem:
         self.last_recognition_frame = 0
         self.recognition_cache_duration = 5  # frames
 
+        # Load existing face data
+        self.load_known_faces()
+
         # Statistics
         self.frame_count = 0
         self.processed_frame_count = 0
@@ -70,9 +74,6 @@ class ThreadedFaceRecognitionSystem:
 
         # Async processing storage
         self.pending_futures = []
-
-        # Load existing face data
-        self.load_known_faces()
 
     def setup_camera_pipe(self):
         """Set up the named pipe for camera streaming"""
@@ -106,7 +107,7 @@ class ThreadedFaceRecognitionSystem:
                 if not self.known_encodings:
                     return []
 
-                small_frame = cv2.resize(frame, (80, 60))  # Reduced size
+                small_frame = cv2.resize(frame, (160, 120))
                 rgb_small_frame = np.ascontiguousarray(small_frame[:, :, ::-1])
 
                 face_locations = face_recognition.face_locations(
@@ -156,7 +157,6 @@ class ThreadedFaceRecognitionSystem:
             return []
 
     def process_recognition_async(self, frame, frame_number):
-        """Process face recognition asynchronously"""
         try:
             result = self.recognize_faces_optimized(frame.copy())
             return frame_number, result
@@ -165,47 +165,43 @@ class ThreadedFaceRecognitionSystem:
             return frame_number, []
 
     def save_known_faces(self):
-        """Save known faces to file"""
         data = {
             'names': self.known_names,
             'encodings': self.known_encodings
         }
         with open(self.faces_data_file, 'wb') as f:
             pickle.dump(data, f)
-        logging.info(f"Saved {len(self.known_names)} known faces")
+        print(f"Saved {len(self.known_names)} known faces")
 
     def load_known_faces(self):
-        """Load known faces from file"""
         if os.path.exists(self.faces_data_file):
             try:
                 with open(self.faces_data_file, 'rb') as f:
                     data = pickle.load(f)
                 self.known_names = data['names']
                 self.known_encodings = data['encodings']
-                logging.info(f"Loaded {len(self.known_names)} known faces")
+                print(f"Loaded {len(self.known_names)} known faces")
             except Exception as e:
-                logging.error(f"Error loading known faces: {e}")
+                print(f"Error loading known faces: {e}")
                 self.known_names = []
                 self.known_encodings = []
         else:
-            logging.info("No existing face data found")
+            print("No existing face data found")
 
     def add_face(self, frame, name):
-        """Add a new face to the known faces database"""
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         face_locations = face_recognition.face_locations(rgb_frame)
         face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
         if len(face_encodings) == 0:
-            logging.warning("No face found in image")
+            print("No face found in image")
             return False
         if len(face_encodings) > 1:
-            logging.warning("Multiple faces detected")
+            print("Multiple faces detected")
             return False
-
         self.known_encodings.append(face_encodings[0])
         self.known_names.append(name)
         self.save_known_faces()
-        logging.info(f"Face '{name}' added successfully!")
+        print(f"Face '{name}' added successfully!")
         return True
 
     def draw_recognition_results(self, frame, recognized_faces):
@@ -220,6 +216,24 @@ class ThreadedFaceRecognitionSystem:
                 label += f" ({confidence:.2f})"
             cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
             cv2.putText(frame, label, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1)
+
+    def compare_two_faces(self, recognized_faces):
+        if len(recognized_faces) == 2:
+            face1, face2 = recognized_faces
+            if (face1['name'] == face2['name'] and 
+                face1['name'] != "Unknown" and 
+                face1['confidence'] > 0.5 and 
+                face2['confidence'] > 0.5):
+                return True, f"MATCH: Both faces are {face1['name']}"
+            elif face1['name'] == "Unknown" and face2['name'] == "Unknown":
+                return None, "Both faces are unknown - cannot determine match"
+            elif (face1['name'] != face2['name'] and 
+                  face1['name'] != "Unknown" and 
+                  face2['name'] != "Unknown"):
+                return False, f"NO MATCH: {face1['name']} vs {face2['name']}"
+            else:
+                return None, "Cannot determine - one face unknown"
+        return None, ""
 
     def calculate_fps(self):
         current_time = time.time()
@@ -243,7 +257,7 @@ class ThreadedFaceRecognitionSystem:
     def run(self):
         try:
             self.setup_camera_pipe()
-            print("=== Optimized Face Recognition System ===")
+            print("=== Face Recognition System ===")
             print("Controls:")
             print("  'q' - Quit")
             print("  'a' - Add current face (type name and press ENTER)")
@@ -254,10 +268,13 @@ class ThreadedFaceRecognitionSystem:
             print("  '+' - Decrease frame skipping (higher CPU usage)")
             print("  '-' - Increase frame skipping (lower CPU usage)")
 
+            screenshot_count = 0
+            recognized_faces = []
+
             while True:
                 ret, frame = self.cap.read()
                 if not ret:
-                    logging.warning("Failed to read frame")
+                    print("Failed to read frame")
                     time.sleep(0.1)
                     continue
 
@@ -300,6 +317,7 @@ class ThreadedFaceRecognitionSystem:
                 cv2.putText(frame_with_faces, f'FPS: {fps:.1f}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                 status = "ON" if self.recognition_enabled else "OFF"
                 cv2.putText(frame_with_faces, f'Recognition: {status}', (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
                 cv2.imshow('Face Recognition System', frame_with_faces)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -331,5 +349,5 @@ class ThreadedFaceRecognitionSystem:
         logging.info("Cleanup completed!")
 
 if __name__ == "__main__":
-    recognition_system = ThreadedFaceRecognitionSystem(width=320, height=240, fps=10)
+    recognition_system = ThreadedFaceRecognitionSystem(width=640, height=480, fps=15)
     recognition_system.run()
