@@ -24,12 +24,12 @@ class ThreadedFaceRecognitionSystem:
         self.rpicam_process = None
         
         # Threading components
-        self.processing_pool = ThreadPoolExecutor(max_workers=2)
+        self.processing_pool = ThreadPoolExecutor(max_workers=1)
         self.processing_lock = threading.Lock()
         self.stop_event = threading.Event()
         
         # Frame processing optimization
-        self.skip_frames = 2  # Process every 3rd frame for recognition
+        self.skip_frames = 3  # Process every 3rd frame for recognition
         self.frame_skip_counter = 0
         
         # Face recognition data
